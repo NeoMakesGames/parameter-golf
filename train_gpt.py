@@ -6,6 +6,7 @@ import io
 import math
 import os
 import random
+import re
 import subprocess
 import sys
 import time
@@ -61,6 +62,7 @@ class Hyperparameters:
     # Model shape.
     vocab_size = int(os.environ.get("VOCAB_SIZE", 1024))
     num_layers = int(os.environ.get("NUM_LAYERS", 9))
+    shared_cycle_len = int(os.environ.get("SHARED_CYCLE_LEN", 1))
     num_kv_heads = int(os.environ.get("NUM_KV_HEADS", 4))
     model_dim = int(os.environ.get("MODEL_DIM", 512))
     num_heads = int(os.environ.get("NUM_HEADS", 8))
@@ -84,6 +86,20 @@ class Hyperparameters:
     beta2 = float(os.environ.get("BETA2", 0.95))
     adam_eps = float(os.environ.get("ADAM_EPS", 1e-8))
     grad_clip_norm = float(os.environ.get("GRAD_CLIP_NORM", 0.0))
+
+    # QAT-like fake quantization (int8 simulation during training).
+    qat_enabled = bool(int(os.environ.get("QAT_ENABLED", "0")))
+    qat_start_step = int(os.environ.get("QAT_START_STEP", 0))
+    qat_ste_blend = float(os.environ.get("QAT_STE_BLEND", 1.0))
+
+    # Optional orchestrated sweep for Muon-centric fast-convergence tuning.
+    hp_sweep = bool(int(os.environ.get("HP_SWEEP", "0")))
+    hp_sweep_max_runs = int(os.environ.get("HP_SWEEP_MAX_RUNS", 8))
+    hp_sweep_time_budget_seconds = float(os.environ.get("HP_SWEEP_TIME_BUDGET_SECONDS", 0.0))
+    sweep_matrix_lr = os.environ.get("SWEEP_MATRIX_LR", "")
+    sweep_muon_momentum = os.environ.get("SWEEP_MUON_MOMENTUM", "")
+    sweep_warmup_steps = os.environ.get("SWEEP_WARMUP_STEPS", "")
+    sweep_qk_gain_init = os.environ.get("SWEEP_QK_GAIN_INIT", "")
 
 # -----------------------------
 # MUON OPTIMIZER 
@@ -421,6 +437,121 @@ def dequantize_state_dict_int8(obj: dict[str, object]) -> dict[str, Tensor]:
     return out
 
 
+def _parse_float_list(spec: str, default: float) -> list[float]:
+    if not spec.strip():
+        return [default]
+    vals: list[float] = []
+    for item in spec.split(","):
+        s = item.strip()
+        if s:
+            vals.append(float(s))
+    return vals or [default]
+
+
+def _parse_int_list(spec: str, default: int) -> list[int]:
+    if not spec.strip():
+        return [default]
+    vals: list[int] = []
+    for item in spec.split(","):
+        s = item.strip()
+        if s:
+            vals.append(int(s))
+    return vals or [default]
+
+
+def _extract_last_metric(text: str, name: str) -> float | None:
+    matches = re.findall(rf"{re.escape(name)}:([0-9]+(?:\.[0-9]+)?)", text)
+    return float(matches[-1]) if matches else None
+
+
+def run_hyperparameter_sweep(args: Hyperparameters) -> int:
+    matrix_lrs = _parse_float_list(args.sweep_matrix_lr, args.matrix_lr)
+    muon_momentums = _parse_float_list(args.sweep_muon_momentum, args.muon_momentum)
+    warmup_steps = _parse_int_list(args.sweep_warmup_steps, args.warmup_steps)
+    qk_gains = _parse_float_list(args.sweep_qk_gain_init, args.qk_gain_init)
+    candidates: list[dict[str, str]] = []
+    for mlr in matrix_lrs:
+        for mom in muon_momentums:
+            for warmup in warmup_steps:
+                for qkg in qk_gains:
+                    candidates.append(
+                        {
+                            "MATRIX_LR": str(mlr),
+                            "MUON_MOMENTUM": str(mom),
+                            "WARMUP_STEPS": str(warmup),
+                            "QK_GAIN_INIT": str(qkg),
+                        }
+                    )
+    if not candidates:
+        print("hp_sweep:no_candidates")
+        return 2
+
+    candidates = candidates[: max(1, args.hp_sweep_max_runs)]
+    budget = args.hp_sweep_time_budget_seconds if args.hp_sweep_time_budget_seconds > 0 else args.max_wallclock_seconds
+    per_run_seconds = budget / max(1, len(candidates)) if budget > 0 else args.max_wallclock_seconds
+    per_run_seconds = max(15.0, per_run_seconds)
+
+    print(
+        f"hp_sweep:start runs:{len(candidates)} per_run_seconds:{per_run_seconds:.2f} "
+        f"budget_seconds:{budget:.2f}"
+    )
+
+    best_idx = -1
+    best_score = float("inf")
+    best_val_bpb: float | None = None
+    best_train_loss: float | None = None
+    for i, cand in enumerate(candidates, start=1):
+        env = os.environ.copy()
+        env["HP_SWEEP"] = "0"
+        env["MATRIX_LR"] = cand["MATRIX_LR"]
+        env["MUON_MOMENTUM"] = cand["MUON_MOMENTUM"]
+        env["WARMUP_STEPS"] = cand["WARMUP_STEPS"]
+        env["QK_GAIN_INIT"] = cand["QK_GAIN_INIT"]
+        env["MAX_WALLCLOCK_SECONDS"] = str(per_run_seconds)
+        env["RUN_ID"] = f"{args.run_id}_sweep{i:02d}"
+        print(
+            f"hp_sweep:trial:{i}/{len(candidates)} matrix_lr:{cand['MATRIX_LR']} "
+            f"muon_momentum:{cand['MUON_MOMENTUM']} warmup_steps:{cand['WARMUP_STEPS']} qk_gain:{cand['QK_GAIN_INIT']}"
+        )
+        proc = subprocess.run(
+            [sys.executable, str(Path(__file__).resolve())],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            env=env,
+            check=False,
+        )
+        out = proc.stdout or ""
+        val_bpb = _extract_last_metric(out, "val_bpb")
+        train_loss = _extract_last_metric(out, "train_loss")
+        score = val_bpb if val_bpb is not None else (train_loss if train_loss is not None else float("inf"))
+        print(
+            f"hp_sweep:trial_result:{i} rc:{proc.returncode} "
+            f"val_bpb:{val_bpb if val_bpb is not None else 'na'} "
+            f"train_loss:{train_loss if train_loss is not None else 'na'}"
+        )
+        if proc.returncode == 0 and score < best_score:
+            best_score = score
+            best_idx = i - 1
+            best_val_bpb = val_bpb
+            best_train_loss = train_loss
+
+    if best_idx < 0:
+        print("hp_sweep:failed no_successful_trial")
+        return 1
+
+    best = candidates[best_idx]
+    print(
+        "hp_sweep:best "
+        f"trial:{best_idx + 1}/{len(candidates)} "
+        f"matrix_lr:{best['MATRIX_LR']} muon_momentum:{best['MUON_MOMENTUM']} "
+        f"warmup_steps:{best['WARMUP_STEPS']} qk_gain:{best['QK_GAIN_INIT']} "
+        f"val_bpb:{best_val_bpb if best_val_bpb is not None else 'na'} "
+        f"train_loss:{best_train_loss if best_train_loss is not None else 'na'}"
+    )
+    return 0
+
+
 # -----------------------------
 # DATA LOADING 
 # -----------------------------
@@ -507,9 +638,37 @@ class RMSNorm(nn.Module):
 
 class CastedLinear(nn.Linear):
     # Keep weights in fp32 for optimizer/state quality, cast at matmul time for bf16 compute.
+    _qat_enabled = False
+    _qat_ste_blend = 1.0
+
+    @classmethod
+    def set_qat_state(cls, enabled: bool, ste_blend: float) -> None:
+        cls._qat_enabled = enabled
+        cls._qat_ste_blend = max(0.0, min(1.0, ste_blend))
+
+    @staticmethod
+    def _fake_quantize_int8_ste(weight: Tensor, ste_blend: float) -> Tensor:
+        w = weight.float()
+        if w.ndim == 2:
+            clip_abs = w.abs().amax(dim=1, keepdim=True).clamp_min(1.0 / 127.0)
+            scale = clip_abs / 127.0
+            q = torch.clamp(torch.round(w / scale), -127, 127)
+            dq = q * scale
+        else:
+            clip_abs = w.abs().amax().clamp_min(1.0 / 127.0)
+            scale = clip_abs / 127.0
+            q = torch.clamp(torch.round(w / scale), -127, 127)
+            dq = q * scale
+        # Straight-through estimator keeps gradients close to the full-precision path.
+        w_qat = w + ste_blend * (dq - w).detach()
+        return w_qat.to(dtype=weight.dtype)
+
     def forward(self, x: Tensor) -> Tensor:
         bias = self.bias.to(x.dtype) if self.bias is not None else None
-        return F.linear(x, self.weight.to(x.dtype), bias)
+        weight = self.weight
+        if self.training and self._qat_enabled:
+            weight = self._fake_quantize_int8_ste(weight, self._qat_ste_blend)
+        return F.linear(x, weight.to(x.dtype), bias)
 
 
 def restore_low_dim_params_to_fp32(module: nn.Module) -> None:
@@ -649,6 +808,7 @@ class GPT(nn.Module):
         self,
         vocab_size: int,
         num_layers: int,
+        shared_cycle_len: int,
         model_dim: int,
         num_heads: int,
         num_kv_heads: int,
@@ -666,19 +826,27 @@ class GPT(nn.Module):
         self.tied_embed_init_std = tied_embed_init_std
         self.logit_softcap = logit_softcap
         self.num_layers = num_layers
+        if shared_cycle_len <= 0:
+            raise ValueError(f"shared_cycle_len must be positive, got {shared_cycle_len}")
+        self.shared_cycle_len = min(shared_cycle_len, num_layers)
         self.tok_emb = nn.Embedding(vocab_size, model_dim)
         self.num_encoder_layers = num_layers // 2
         self.num_decoder_layers = num_layers - self.num_encoder_layers
         self.num_skip_weights = min(self.num_encoder_layers, self.num_decoder_layers)
         self.skip_weights = nn.Parameter(torch.ones(self.num_skip_weights, model_dim, dtype=torch.float32))
-        # Weight sharing: single shared block instead of ModuleList
-        self.shared_block = Block(
-            model_dim,
-            num_heads,
-            num_kv_heads,
-            mlp_mult,
-            rope_base,
-            qk_gain_init,
+        # Recursive weight sharing with a small reusable cycle of blocks.
+        self.shared_blocks = nn.ModuleList(
+            [
+                Block(
+                    model_dim,
+                    num_heads,
+                    num_kv_heads,
+                    mlp_mult,
+                    rope_base,
+                    qk_gain_init,
+                )
+                for _ in range(self.shared_cycle_len)
+            ]
         )
         self.final_norm = RMSNorm()
         self.lm_head = None if tie_embeddings else CastedLinear(model_dim, vocab_size, bias=False)
@@ -699,14 +867,11 @@ class GPT(nn.Module):
         x0 = x
         skips: list[Tensor] = []
 
-        # Loop through shared block num_layers times (weight sharing)
         for i in range(self.num_layers):
-            x = self.shared_block(x, x0)
-            # Store skip connections in first half
+            x = self.shared_blocks[i % self.shared_cycle_len](x, x0)
             if i < self.num_encoder_layers:
                 skips.append(x)
-            # Apply skip connections in second half
-            elif skips and len(skips) > 0:
+            elif skips:
                 x = x + self.skip_weights[i - self.num_encoder_layers].to(dtype=x.dtype)[None, None, :] * skips.pop()
 
         x = self.final_norm(x).reshape(-1, x.size(-1))
@@ -730,6 +895,8 @@ def main() -> None:
 
     code = Path(__file__).read_text(encoding="utf-8")
     args = Hyperparameters()
+    if args.hp_sweep and os.environ.get("RANK") is None:
+        raise SystemExit(run_hyperparameter_sweep(args))
     compile_muon = bool(int(os.environ.get("COMPILE_MUON", "0")))
     if compile_muon and os.name != "nt":
         zeropower_via_newtonschulz5 = torch.compile(zeropower_via_newtonschulz5)
@@ -835,6 +1002,7 @@ def main() -> None:
     base_model = GPT(
         vocab_size=args.vocab_size,
         num_layers=args.num_layers,
+        shared_cycle_len=args.shared_cycle_len,
         model_dim=args.model_dim,
         num_heads=args.num_heads,
         num_kv_heads=args.num_kv_heads,
@@ -858,7 +1026,7 @@ def main() -> None:
     # - untied lm_head (Adam) uses HEAD_LR
     # - matrix params in transformer blocks use MATRIX_LR via Muon
     # - vectors/scalars use SCALAR_LR via Adam
-    block_named_params = list(base_model.shared_block.named_parameters())
+    block_named_params = list(base_model.shared_blocks.named_parameters())
     matrix_params = [
         p
         for name, p in block_named_params
@@ -908,6 +1076,14 @@ def main() -> None:
     log0("sdp_backends:cudnn=False flash=False mem_efficient=False math=True")
     log0(f"attention_mode:gqa num_heads:{args.num_heads} num_kv_heads:{args.num_kv_heads}")
     log0(
+        f"weight_sharing:enabled num_layers:{args.num_layers} shared_cycle_len:{args.shared_cycle_len} "
+        f"effective_reuse:{args.num_layers / max(args.shared_cycle_len, 1):.2f}x"
+    )
+    log0(
+        f"qat_enabled:{args.qat_enabled} qat_start_step:{args.qat_start_step} "
+        f"qat_ste_blend:{args.qat_ste_blend:.3f}"
+    )
+    log0(
         f"tie_embeddings:{args.tie_embeddings} embed_lr:{token_lr} "
         f"head_lr:{args.head_lr if base_model.lm_head is not None else 0.0} "
         f"matrix_lr:{args.matrix_lr} scalar_lr:{args.scalar_lr}"
@@ -953,6 +1129,7 @@ def main() -> None:
         if master_process and tqdm is not None:
             warmup_pbar = tqdm(total=args.warmup_steps, desc="warmup", dynamic_ncols=True)
         for warmup_step in range(args.warmup_steps):
+            CastedLinear.set_qat_state(False, args.qat_ste_blend)
             zero_grad_all()
             for micro_step in range(grad_accum_steps):
                 if distributed:
@@ -1037,6 +1214,7 @@ def main() -> None:
 
         elapsed_ms = training_time_ms + 1000.0 * (time.perf_counter() - t0)
         scale = lr_mul(step, elapsed_ms)
+        CastedLinear.set_qat_state(args.qat_enabled and step >= args.qat_start_step, args.qat_ste_blend)
         zero_grad_all()
         train_loss = torch.zeros((), device=device)
         for micro_step in range(grad_accum_steps):
