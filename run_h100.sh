@@ -28,6 +28,8 @@ COMPILE_MODE="${COMPILE_MODE:-max-autotune-no-cudagraphs}"
 SDP_BACKEND="${SDP_BACKEND:-auto}"
 
 PREFLIGHT_CHECK_DATA="${PREFLIGHT_CHECK_DATA:-1}"
+PREFLIGHT_BAD_SHARD_ACTION="${PREFLIGHT_BAD_SHARD_ACTION:-skip}"  # one of: skip, remove, fail
+export PREFLIGHT_BAD_SHARD_ACTION
 
 mkdir -p "${OUT_DIR}"
 export OUT_DIR
@@ -60,6 +62,7 @@ cp -f requirements.txt "${OUT_DIR}/requirements.txt"
 
 if [[ "${PREFLIGHT_CHECK_DATA}" == "1" ]]; then
   echo "[2.6/4] Validating dataset shards before training..."
+  echo "preflight_bad_shard_action=${PREFLIGHT_BAD_SHARD_ACTION}"
   python - <<'PY'
 import glob
 import json
@@ -119,11 +122,33 @@ for p in all_files:
     bad.append(entry)
 
 out_dir = Path(os.environ["OUT_DIR"])
+(out_dir / "preflight_bad_shard_action.txt").write_text(os.environ.get("PREFLIGHT_BAD_SHARD_ACTION", "skip"), encoding="utf-8")
 (out_dir / "dataset_shard_report.json").write_text(json.dumps(report, indent=2), encoding="utf-8")
 if bad:
   (out_dir / "dataset_shard_errors.json").write_text(json.dumps(bad, indent=2), encoding="utf-8")
+  action = os.environ.get("PREFLIGHT_BAD_SHARD_ACTION", "skip").strip().lower()
+  if action not in {"skip", "remove", "fail"}:
+    raise SystemExit(f"Invalid PREFLIGHT_BAD_SHARD_ACTION={action}; expected skip|remove|fail")
+
   bad_preview = "\n".join(f" - {b['file']}: {b['error']}" for b in bad[:10])
-  raise SystemExit(f"Dataset preflight failed with {len(bad)} bad shards:\n{bad_preview}")
+  if action == "fail":
+    raise SystemExit(f"Dataset preflight failed with {len(bad)} bad shards:\n{bad_preview}")
+
+  if action == "remove":
+    removed = []
+    for b in bad:
+      p = Path(b["file"])
+      try:
+        p.unlink(missing_ok=True)
+        removed.append(str(p))
+      except Exception as e:
+        print(f"warning: failed to remove bad shard {p}: {e}")
+    (out_dir / "dataset_removed_shards.json").write_text(json.dumps(removed, indent=2), encoding="utf-8")
+    print(f"dataset_preflight:removed_bad_shards count={len(removed)}")
+  else:
+    print(f"dataset_preflight:skipping_bad_shards count={len(bad)}")
+  print("dataset_preflight:continuing_with_valid_shards")
+  print(bad_preview)
 
 print(f"dataset_preflight:ok shards={len(report)}")
 PY
