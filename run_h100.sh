@@ -21,6 +21,12 @@ VOCAB_SIZE="${VOCAB_SIZE:-1024}"
 TRAIN_LOG_EVERY="${TRAIN_LOG_EVERY:-50}"
 VAL_LOSS_EVERY="${VAL_LOSS_EVERY:-200}"
 
+# Linux/Triton acceleration knobs for train_gpt.py.
+COMPILE_MODEL="${COMPILE_MODEL:-1}"
+COMPILE_MUON="${COMPILE_MUON:-1}"
+COMPILE_MODE="${COMPILE_MODE:-reduce-overhead}"
+SDP_BACKEND="${SDP_BACKEND:-auto}"
+
 mkdir -p "${OUT_DIR}"
 
 echo "[1/4] Creating venv if needed..."
@@ -40,6 +46,7 @@ grep -viE '^\s*torch(==|\s|$)' requirements.txt > "${OUT_DIR}/requirements.no_to
 pip install -r "${OUT_DIR}/requirements.no_torch.txt"
 
 echo "[3/4] Running training..."
+echo "compile_model=${COMPILE_MODEL} compile_muon=${COMPILE_MUON} compile_mode=${COMPILE_MODE} sdp_backend=${SDP_BACKEND}"
 (
   export RUN_ID
   export MAX_WALLCLOCK_SECONDS="${MAX_SECS}"
@@ -48,6 +55,10 @@ echo "[3/4] Running training..."
   export VOCAB_SIZE
   export TRAIN_LOG_EVERY
   export VAL_LOSS_EVERY
+  export COMPILE_MODEL
+  export COMPILE_MUON
+  export COMPILE_MODE
+  export SDP_BACKEND
 
   torchrun --standalone --nproc_per_node=1 train_gpt.py
 ) 2>&1 | tee "${OUT_DIR}/console.log"

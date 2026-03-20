@@ -86,6 +86,10 @@ class Hyperparameters:
     beta2 = float(os.environ.get("BETA2", 0.95))
     adam_eps = float(os.environ.get("ADAM_EPS", 1e-8))
     grad_clip_norm = float(os.environ.get("GRAD_CLIP_NORM", 0.0))
+    compile_muon = bool(int(os.environ.get("COMPILE_MUON", "1" if os.name != "nt" else "0")))
+    compile_model = bool(int(os.environ.get("COMPILE_MODEL", "1" if os.name != "nt" else "0")))
+    compile_mode = os.environ.get("COMPILE_MODE", "reduce-overhead")
+    sdp_backend = os.environ.get("SDP_BACKEND", "auto").strip().lower()
 
     # QAT-like fake quantization (int8 simulation during training).
     qat_enabled = bool(int(os.environ.get("QAT_ENABLED", "0")))
@@ -897,8 +901,7 @@ def main() -> None:
     args = Hyperparameters()
     if args.hp_sweep and os.environ.get("RANK") is None:
         raise SystemExit(run_hyperparameter_sweep(args))
-    compile_muon = bool(int(os.environ.get("COMPILE_MUON", "0")))
-    if compile_muon and os.name != "nt":
+    if args.compile_muon and os.name != "nt":
         zeropower_via_newtonschulz5 = torch.compile(zeropower_via_newtonschulz5)
 
     # -----------------------------
@@ -928,11 +931,22 @@ def main() -> None:
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
     from torch.backends.cuda import enable_cudnn_sdp, enable_flash_sdp, enable_math_sdp, enable_mem_efficient_sdp
+    sdp_backend = args.sdp_backend
+    if sdp_backend not in {"auto", "math", "flash"}:
+        raise ValueError(f"Unsupported SDP_BACKEND={args.sdp_backend}; expected one of auto|math|flash")
+    if sdp_backend == "math" or os.name == "nt":
+        sdp_cfg = dict(cudnn=False, flash=False, mem=False, math=True)
+    elif sdp_backend == "flash":
+        # Flash-preferred path. Keep math fallback on to avoid hard failures if kernels mismatch.
+        sdp_cfg = dict(cudnn=False, flash=True, mem=True, math=True)
+    else:
+        # Linux default: allow fused backends while retaining math fallback.
+        sdp_cfg = dict(cudnn=False, flash=(os.name != "nt"), mem=(os.name != "nt"), math=True)
 
-    enable_cudnn_sdp(False)
-    enable_flash_sdp(False)
-    enable_mem_efficient_sdp(False)
-    enable_math_sdp(True)
+    enable_cudnn_sdp(sdp_cfg["cudnn"])
+    enable_flash_sdp(sdp_cfg["flash"])
+    enable_mem_efficient_sdp(sdp_cfg["mem"])
+    enable_math_sdp(sdp_cfg["math"])
 
     logfile = None
     if master_process:
@@ -1017,8 +1031,9 @@ def main() -> None:
         if isinstance(module, CastedLinear):
             module.float()
     restore_low_dim_params_to_fp32(base_model)
-    # torch.compile not available on Windows without Triton - use model directly
-    compiled_model = base_model
+    compiled_model: nn.Module = base_model
+    if args.compile_model and os.name != "nt":
+        compiled_model = torch.compile(base_model, mode=args.compile_mode)
     model: nn.Module = DDP(compiled_model, device_ids=[local_rank], broadcast_buffers=False) if distributed else compiled_model
 
     # Optimizer split:
@@ -1073,7 +1088,14 @@ def main() -> None:
     n_params = sum(p.numel() for p in base_model.parameters())
     log0(f"model_params:{n_params}")
     log0(f"world_size:{world_size} grad_accum_steps:{grad_accum_steps}")
-    log0("sdp_backends:cudnn=False flash=False mem_efficient=False math=True")
+    log0(
+        f"sdp_backends:cudnn={sdp_cfg['cudnn']} flash={sdp_cfg['flash']} "
+        f"mem_efficient={sdp_cfg['mem']} math={sdp_cfg['math']}"
+    )
+    log0(
+        f"compile_muon:{args.compile_muon and os.name != 'nt'} "
+        f"compile_model:{args.compile_model and os.name != 'nt'} compile_mode:{args.compile_mode}"
+    )
     log0(f"attention_mode:gqa num_heads:{args.num_heads} num_kv_heads:{args.num_kv_heads}")
     log0(
         f"weight_sharing:enabled num_layers:{args.num_layers} shared_cycle_len:{args.shared_cycle_len} "
