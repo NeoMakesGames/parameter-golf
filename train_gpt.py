@@ -592,12 +592,27 @@ class TokenStream:
         if not self.files:
             raise FileNotFoundError(f"No files found for pattern: {pattern}")
         self.file_idx = 0
-        self.tokens = load_data_shard(self.files[0])
+        self.tokens = self._load_valid_file(start_idx=0)
         self.pos = 0
 
+    def _load_valid_file(self, start_idx: int) -> Tensor:
+        # Some cloud downloads can leave a truncated shard behind; skip those files
+        # so long runs don't crash after many minutes.
+        num_files = len(self.files)
+        for offset in range(num_files):
+            idx = (start_idx + offset) % num_files
+            file = self.files[idx]
+            try:
+                self.file_idx = idx
+                return load_data_shard(file)
+            except Exception as e:
+                print(f"warning: skipping unreadable shard {file}: {e}")
+                continue
+        raise RuntimeError(f"All shards matching pattern are unreadable ({num_files} files)")
+
     def _advance_file(self) -> None:
-        self.file_idx = (self.file_idx + 1) % len(self.files)
-        self.tokens = load_data_shard(self.files[self.file_idx])
+        next_idx = (self.file_idx + 1) % len(self.files)
+        self.tokens = self._load_valid_file(start_idx=next_idx)
         self.pos = 0
 
     def take(self, n: int) -> Tensor:
