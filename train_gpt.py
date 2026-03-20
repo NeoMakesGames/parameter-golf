@@ -88,7 +88,7 @@ class Hyperparameters:
     grad_clip_norm = float(os.environ.get("GRAD_CLIP_NORM", 0.0))
     compile_muon = bool(int(os.environ.get("COMPILE_MUON", "1" if os.name != "nt" else "0")))
     compile_model = bool(int(os.environ.get("COMPILE_MODEL", "1" if os.name != "nt" else "0")))
-    compile_mode = os.environ.get("COMPILE_MODE", "reduce-overhead")
+    compile_mode = os.environ.get("COMPILE_MODE", "max-autotune-no-cudagraphs")
     sdp_backend = os.environ.get("SDP_BACKEND", "auto").strip().lower()
 
     # QAT-like fake quantization (int8 simulation during training).
@@ -274,6 +274,7 @@ def eval_val(
             local = val_tokens[raw_start:raw_end].to(device=device, dtype=torch.int64, non_blocking=True)
             x = local[:-1].reshape(-1, args.train_seq_len)
             y = local[1:].reshape(-1, args.train_seq_len)
+            cudagraph_step_begin()
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
                 batch_loss = model(x, y).detach()
             batch_token_count = float(y.numel())
@@ -295,6 +296,12 @@ def eval_val(
     tokens_per_byte = val_token_count.item() / val_byte_count.item()
     model.train()
     return float(val_loss.item()), float(bits_per_token * tokens_per_byte)
+
+
+def cudagraph_step_begin() -> None:
+    # Safe no-op on versions/builds without this API.
+    if hasattr(torch, "compiler") and hasattr(torch.compiler, "cudagraph_mark_step_begin"):
+        torch.compiler.cudagraph_mark_step_begin()
 
 # -----------------------------
 # POST-TRAINING QUANTIZATION
@@ -1157,6 +1164,7 @@ def main() -> None:
                 if distributed:
                     model.require_backward_grad_sync = micro_step == grad_accum_steps - 1
                 x, y = train_loader.next_batch(args.train_batch_tokens, args.train_seq_len, grad_accum_steps)
+                cudagraph_step_begin()
                 with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
                     warmup_loss = model(x, y)
                 (warmup_loss * grad_scale).backward()
@@ -1243,6 +1251,7 @@ def main() -> None:
             if distributed:
                 model.require_backward_grad_sync = micro_step == grad_accum_steps - 1
             x, y = train_loader.next_batch(args.train_batch_tokens, args.train_seq_len, grad_accum_steps)
+            cudagraph_step_begin()
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
                 loss = model(x, y)
             train_loss += loss.detach()

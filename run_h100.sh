@@ -24,7 +24,7 @@ VAL_LOSS_EVERY="${VAL_LOSS_EVERY:-200}"
 # Linux/Triton acceleration knobs for train_gpt.py.
 COMPILE_MODEL="${COMPILE_MODEL:-1}"
 COMPILE_MUON="${COMPILE_MUON:-1}"
-COMPILE_MODE="${COMPILE_MODE:-reduce-overhead}"
+COMPILE_MODE="${COMPILE_MODE:-max-autotune-no-cudagraphs}"
 SDP_BACKEND="${SDP_BACKEND:-auto}"
 
 mkdir -p "${OUT_DIR}"
